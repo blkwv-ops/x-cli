@@ -13,6 +13,8 @@ from .auth import Credentials, generate_oauth_header
 
 API_BASE = "https://api.x.com/2"
 UPLOAD_BASE = "https://upload.twitter.com/1.1/media/upload.json"
+STREAM_BASE = f"{API_BASE}/tweets/search/stream"
+STREAM_RULES = f"{STREAM_BASE}/rules"
 
 # Chunked upload threshold: files > 1 MB use chunked flow (required for video).
 _CHUNK_THRESHOLD = 1 * 1024 * 1024
@@ -60,6 +62,72 @@ class XApiClient:
             msg = "; ".join(e.get("detail") or e.get("message", "") for e in errors) or resp.text[:500]
             raise RuntimeError(f"API error (HTTP {resp.status_code}): {msg}")
         return data
+
+    # ---- filtered stream (tweets in near real-time) ----
+
+    def get_stream_rules(self) -> dict[str, Any]:
+        """Fetch current filtered stream rules.
+
+        Uses Bearer token auth. See https://developer.x.com/en/docs/twitter-api/tweets/filtered-stream/introduction
+        """
+        return self._bearer_get(STREAM_RULES)
+
+    def add_stream_rule(self, value: str, tag: str | None = None) -> dict[str, Any]:
+        """Add a single filtered stream rule.
+
+        `value` is the rule query (e.g. "from:TradeHawk OR from:DeItaone -is:retweet").
+        """
+        payload: dict[str, Any] = {"add": [{"value": value}]}
+        if tag:
+            payload["add"][0]["tag"] = tag
+        resp = self._http.post(
+            STREAM_RULES,
+            headers={"Authorization": f"Bearer {self.creds.bearer_token}"},
+            json=payload,
+        )
+        return self._handle(resp)
+
+    def delete_all_stream_rules(self) -> dict[str, Any]:
+        """Delete all existing filtered stream rules for this app.
+
+        NOTE: This affects the app globally; callers should use with care.
+        """
+        rules = self.get_stream_rules()
+        data = rules.get("data") or []
+        if not data:
+            return rules
+        ids = [r["id"] for r in data if "id" in r]
+        if not ids:
+            return rules
+        payload = {"delete": {"ids": ids}}
+        resp = self._http.post(
+            STREAM_RULES,
+            headers={"Authorization": f"Bearer {self.creds.bearer_token}"},
+            json=payload,
+        )
+        return self._handle(resp)
+
+    def stream_filtered(self, params: dict[str, str] | None = None):
+        """Yield raw JSON lines from the filtered stream.
+
+        This is a generator that blocks until the connection is closed. It is
+        up to the caller to handle KeyboardInterrupt and reconnection logic.
+        """
+        headers = {"Authorization": f"Bearer {self.creds.bearer_token}"}
+        with self._http.stream("GET", STREAM_BASE, headers=headers, params=params or {}) as resp:
+            if resp.status_code != 200:
+                # Read the body so we can parse the error
+                resp.read()
+                data = resp.json()
+                errors = data.get("errors", [])
+                msg = "; ".join(e.get("detail") or e.get("message", "") for e in errors) or str(data)[:500]
+                raise RuntimeError(f"Stream error (HTTP {resp.status_code}): {msg}")
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8", errors="replace")
+                yield line
 
     def get_authenticated_user_id(self) -> str:
         if self._user_id:
